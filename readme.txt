@@ -1,0 +1,1 @@
+A specialized version of the Adafruit PN532 I2C library. Designed to work specifically with Mifare Classic cards.
