@@ -11,33 +11,45 @@ PN532_I2C::PN532_I2C(TwoWire& wire, uint16_t timeout) {
 
 /*!
     @brief  Configure I2C, Hardware operating Params, and perform RF Test
+    @param  initI2C     Optional: Initialize I2C
     @param  rfParams    Optional: List of RFConfigData to set
     @param  numRFParams The number of RF Parameters to be set
     @param  params      Optional: Sets default operating Parameters
     @param  samConfig   Optional: Sets SAM configuration, default = Bypass
+    @returns Status code
 */
-void PN532_I2C::Configure(RFConfigData* rfParams, uint8_t numRFParams, PN532_Params params, SAMConfigMode samConfig) {
-    _wire->begin();
+uint8_t PN532_I2C::Configure(bool initI2C, RFConfigData* rfParams, uint8_t numRFParams, PN532_Params params, SAMConfigMode samConfig) {
+    
+    if(initI2C) _wire->begin();
     Wakeup();
 
     memset(_dataBuffer, 0, Max_Buffer_Size);
 
+    // TODO: Get current configuration for comparison
+
     uint8_t status = SetParameters(params);
-    if (status != PN532_Error::Success) LOG_ERROR("SetParameters()", status);
+    if (status != PN532_Error::Success) {
+        LOG_ERROR("SetParameters()", status);
+        return status;
+    }
 
     status = ConfigureSAM(samConfig);
-    if (status != PN532_Error::Success) LOG_ERROR("ConfigureSAM()", status);
+    if (status != PN532_Error::Success) {
+        LOG_ERROR("ConfigureSAM()", status);
+        return status;
+    }
 
     if (rfParams) {
         for (uint8_t i = 0; i < numRFParams; i++) {
             status = SetRFConfiguration(rfParams[i]);
-            if (status != PN532_Error::Success) LOG_ERROR("SetRFConfiguration()", status);
+            if (status != PN532_Error::Success) {
+                LOG_ERROR("SetRFConfiguration()", status);
+                return status;
+            }
         }
     }
 
-    _dataBuffer[0] = PN532_Command::RFRegulationTest;
-    _dataBuffer[1] = Tag_Type::Mifare;
-    WriteI2C(_dataBuffer, 2);
+    return PerformRFTest();
 }
 
 /*!
@@ -179,6 +191,7 @@ uint8_t PN532_I2C::FindTargetByUID(uint8_t* targetUID) {
     @returns  Number of unique tags found
 */
 // TODO: Error Handling can be improved, improve speed and accuracy
+// BUG: Tags are held in PN532 memory making them not scanable on sequential calls
 uint8_t PN532_I2C::ScanForTargets(MifareClassic* tagsList, uint8_t maxExpectedTargets, uint8_t maxRetries) {
 
     uint8_t tagCount = 0;
@@ -282,7 +295,7 @@ uint8_t PN532_I2C::WriteDataBlock(uint8_t indexedTagNumber, uint8_t blockNumber,
 
     if (status != PN532_Error::Success) return status;
     
-    uint8_t buffer[17];
+    uint8_t buffer[17]{};
     buffer[0] = blockNumber;
     memcpy(buffer + 1, dataBuffer, 16);
 
@@ -312,6 +325,13 @@ uint8_t PN532_I2C::HaltActiveTarget(int8_t indexedTagNumber, bool keepDataInRegi
 
 #pragma region Data Buffer Preparation
 
+uint8_t PN532_I2C::PerformRFTest(void) {
+
+    _dataBuffer[0] = PN532_Command::RFRegulationTest;
+    _dataBuffer[1] = Tag_Type::Mifare;
+    return WriteI2C(_dataBuffer, 2);
+}
+
 // TODO: Can we remove the strings unless using a deeper debug? Should we?
 uint8_t PN532_I2C::SetParameters(PN532_Params params) {
 
@@ -339,7 +359,8 @@ uint8_t PN532_I2C::SetParameters(PN532_Params params) {
     _dataBuffer[0] = PN532_Command::setParams;
     _dataBuffer[1] = paramsBit;
 
-    WriteI2C(_dataBuffer, 2, true);
+    WriteI2C(_dataBuffer, 2);
+    _suppressPrePostAmble = params.suppressPrePostAmble;
     return ReadI2C(_dataBuffer);
 }
 
@@ -493,7 +514,7 @@ uint8_t PN532_I2C::InCommunicateThrough(uint8_t* data, uint8_t dataLength) {
 
 uint8_t PN532_I2C::SendRecieveDataBuffer(uint8_t headerLength, uint8_t* data, uint8_t dataLength) {
 
-    uint8_t status = WriteI2C(_dataBuffer, headerLength, false, data, dataLength);
+    uint8_t status = WriteI2C(_dataBuffer, headerLength, data, dataLength);
     if (status != PN532_Error::Success) {
         LOG_ERROR("WriteI2C()", status);
         return status;
@@ -515,10 +536,10 @@ uint8_t PN532_I2C::SendRecieveDataBuffer(uint8_t headerLength, uint8_t* data, ui
 */
 // TODO: This can be improved to check the IRQ after implementing power down
 void PN532_I2C::Wakeup() {
-    delay(500);
+    delay(100);
 }
 
-uint8_t PN532_I2C::WriteI2C(const uint8_t* header, uint8_t hlen, bool useFullAck, const uint8_t* body, uint8_t blen) {
+uint8_t PN532_I2C::WriteI2C(const uint8_t* header, uint8_t hlen, const uint8_t* body, uint8_t blen) {
 
     _wire->beginTransmission(PN532_I2C_Address);
 
@@ -558,10 +579,9 @@ uint8_t PN532_I2C::WriteI2C(const uint8_t* header, uint8_t hlen, bool useFullAck
     LOG("\n");
 
     _wire->endTransmission();
-    return ReadAckFrame(useFullAck);
+    return ReadAckFrame();
 }
 
-// If Pre/PostAmble are enabled add a _wire->read() before the NFC_TransferBytes::StartCode1
 uint8_t PN532_I2C::ReadI2C(uint8_t* buffer) {
 
     uint16_t time = 0;
@@ -580,6 +600,7 @@ uint8_t PN532_I2C::ReadI2C(uint8_t* buffer) {
 
     } while (1);
 
+    if (!_suppressPrePostAmble) _wire->read();
     if (NFC_TransferBytes::StartCode1   != _wire->read() ||
         NFC_TransferBytes::StartCode2   != _wire->read()) {
 
@@ -613,13 +634,12 @@ uint8_t PN532_I2C::ReadI2C(uint8_t* buffer) {
     return !checksum ? PN532_Error::Success : PN532_Error::ChecksumError;
 }
 
-// If Pre/PostAmble are enabled: PN532_ACK[] = { 0, 0, 0xFF, 0, 0xFF, 0 }
-uint8_t PN532_I2C::ReadAckFrame(bool useFullAck) {
+uint8_t PN532_I2C::ReadAckFrame() {
     
-    uint8_t shortAck[] = { 0, 0xFF, 0, 0xFF };
+    uint8_t shortAck[] =   { 0, 0xFF, 0, 0xFF };
     uint8_t longAck[] = { 0, 0, 0xFF, 0, 0xFF, 0 };
     
-    uint8_t bufferSize = useFullAck ? sizeof(longAck) : sizeof(shortAck);
+    uint8_t bufferSize = _suppressPrePostAmble ? sizeof(shortAck) : sizeof(longAck);
     uint8_t ackBuf[6]{};
 
     uint16_t time = 0;
@@ -638,15 +658,13 @@ uint8_t PN532_I2C::ReadAckFrame(bool useFullAck) {
         ackBuf[i] = _wire->read();
     }
 
-    if (useFullAck) {
-        return memcmp(ackBuf, longAck, sizeof(longAck))
-            ? PN532_Error::InvalidACK
-            : PN532_Error::Success;
-    }
+    int outcome = _suppressPrePostAmble
+        ? memcmp(ackBuf, shortAck, sizeof(shortAck))
+        : memcmp(ackBuf, longAck, sizeof(longAck));
 
-    return memcmp(ackBuf, shortAck, sizeof(shortAck))
-        ? PN532_Error::InvalidACK
-        : PN532_Error::Success;
+    return outcome == PN532_Error::Success
+        ? PN532_Error::Success
+        : PN532_Error::InvalidACK;
 }
 
 #pragma endregion
