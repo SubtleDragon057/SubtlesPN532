@@ -11,33 +11,45 @@ PN532_I2C::PN532_I2C(TwoWire& wire, uint16_t timeout) {
 
 /*!
     @brief  Configure I2C, Hardware operating Params, and perform RF Test
+    @param  initI2C     Optional: Initialize I2C
     @param  rfParams    Optional: List of RFConfigData to set
     @param  numRFParams The number of RF Parameters to be set
     @param  params      Optional: Sets default operating Parameters
     @param  samConfig   Optional: Sets SAM configuration, default = Bypass
+    @returns Status code
 */
-void PN532_I2C::Configure(RFConfigData* rfParams, uint8_t numRFParams, PN532_Params params, SAMConfigMode samConfig) {
-    _wire->begin();
+uint8_t PN532_I2C::Configure(bool initI2C, RFConfigData* rfParams, uint8_t numRFParams, PN532_Params params, SAMConfigMode samConfig) {
+    
+    if(initI2C) _wire->begin();
     Wakeup();
 
     memset(_dataBuffer, 0, Max_Buffer_Size);
 
+    // TODO: Get current configuration for comparison
+
     uint8_t status = SetParameters(params);
-    if (status != PN532_Error::Success) LOG_ERROR("SetParameters()", status);
+    if (status != PN532_Error::Success) {
+        LOG_ERROR("SetParameters()", status);
+        return status;
+    }
 
     status = ConfigureSAM(samConfig);
-    if (status != PN532_Error::Success) LOG_ERROR("ConfigureSAM()", status);
+    if (status != PN532_Error::Success) {
+        LOG_ERROR("ConfigureSAM()", status);
+        return status;
+    }
 
     if (rfParams) {
         for (uint8_t i = 0; i < numRFParams; i++) {
             status = SetRFConfiguration(rfParams[i]);
-            if (status != PN532_Error::Success) LOG_ERROR("SetRFConfiguration()", status);
+            if (status != PN532_Error::Success) {
+                LOG_ERROR("SetRFConfiguration()", status);
+                return status;
+            }
         }
     }
 
-    _dataBuffer[0] = PN532_Command::RFRegulationTest;
-    _dataBuffer[1] = Tag_Type::Mifare;
-    WriteI2C(_dataBuffer, 2);
+    return PerformRFTest();
 }
 
 /*!
@@ -163,154 +175,85 @@ uint8_t PN532_I2C::EnterPowerDownMode() {
 #pragma region Mifare Classic Helper Functions
 
 /*!
-    @brief    Searches RF Field for target with the specified UID
-    @param    targetUID    The UID of the tag to search for
-    @returns  Status code
-*/
-uint8_t PN532_I2C::FindTargetByUID(uint8_t* targetUID) {
-    return InListPassiveTarget(1, targetUID, sizeof(targetUID));
-}
-
-/*!
     @brief    Scans for available tags and then attempts to add them to a list of NFC Tags
     @param    tagsList            List to be populated with NFC tag data
-    @param    maxExpectedTargets  Total number of expected targets to find in field simultaneously
+    @param    maxExpectedTargets  Total number of expected targets to find in field simultaneously, min 1
     @param    maxRetries          Max number of times to search the field
     @returns  Number of unique tags found
 */
-// TODO: Error Handling can be improved, improve speed and accuracy
+// BUG: Can't handle more than 2 tags in the RF Field
 uint8_t PN532_I2C::ScanForTargets(MifareClassic* tagsList, uint8_t maxExpectedTargets, uint8_t maxRetries) {
 
-    uint8_t tagCount = 0;
+    uint8_t uniqueTagCount = 0;
+    uint8_t numTagsToSearchFor = maxExpectedTargets > Max_PN532_Targets ? Max_PN532_Targets : maxExpectedTargets;
+
+    if(maxExpectedTargets <= 0) return 0;
+
     do {
-        uint8_t status = InListPassiveTarget(2);
+        uint8_t status = InListPassiveTarget(numTagsToSearchFor);
         if (status != PN532_Error::Success) continue;
 
         for (uint8_t i = 0; i < _dataBuffer[0]; i++) {
             if (!IsUniqueUID(tagsList, _inListedTags[i].UID)) continue;
 
             uint8_t emptyArrayIndex = GetNextEmptyIndex(tagsList);
-            if (emptyArrayIndex == 255) break;
+            if (emptyArrayIndex >= 255) break;
 
-            tagsList[emptyArrayIndex].Initialized = true;
-            memcpy(tagsList[emptyArrayIndex].UID, _inListedTags[i].UID, _inListedTags[i].UIDLen);
-            tagCount++;
+            tagsList[emptyArrayIndex].Activate(_inListedTags[i].UID);
+            uniqueTagCount++;
         }
 
-        HaltActiveTarget(-1, true);
-        if (tagCount >= maxExpectedTargets) break;
+        if (uniqueTagCount >= maxExpectedTargets) break;
+        
+        HaltActiveTarget();
 
     } while (maxRetries-- > 0);
 
-    return tagCount;
+    HaltActiveTarget();
+    return uniqueTagCount;
 }
 
 /*!
     @brief    Scans RF Field for designated tag, authenticates and performs a Read/Write on specified block
+    @param    command         Only Supports Read or Write commands
     @param    targetUID       Target to search for and operate on
     @param    blockNumber     Block number to authenticate and read from/write to
-    @param    command         Only Supports Read or Write commands
     @param    dataBuffer      Buffer to read to, or write from
     @returns  Status code
 */
-uint8_t PN532_I2C::QuickAccessMifareTarget(uint8_t* targetUID, uint8_t blockNumber, Mifare_Command command, uint8_t* dataBuffer) {
+uint8_t PN532_I2C::HandleTargetOperation(Mifare_Command command, uint8_t* targetUID, uint8_t blockNumber, uint8_t* dataBuffer) {
 
     uint8_t status = InListPassiveTarget(1, targetUID, sizeof(targetUID));
     if (status != PN532_Error::Success) return status;
 
+    status = AuthenticateBlock(0, blockNumber);
+    if (status != PN532_Error::Success) return status;
+
     switch (command) {
         case PN532_I2C::Read:
-            status = ReadDataBlock(0, blockNumber, dataBuffer);
+            status = ReadActiveDataBlock(0, blockNumber, dataBuffer);
             break;
         case PN532_I2C::Write:
-            status = WriteDataBlock(0, blockNumber, dataBuffer);
+            status = WriteActiveDataBlock(0, blockNumber, dataBuffer);
             break;
         default:
             status = PN532_Error::SyntaxError;
             break;
     }
 
-    return status != PN532_Error::Success
-        ? status
-        : HaltActiveTarget();
-}
-
-/*!
-    @brief    Authenticates, then reads a block of the Mifare Tag's memory
-    @param    indexedTagNumber  The index of the tag to read
-    @param    blockNumber       Block number to authenticate and read from/write to
-    @param    responseBuffer    Buffer to read the data to
-    @returns  Status code
-*/
-uint8_t PN532_I2C::ReadDataBlock(uint8_t indexedTagNumber, uint8_t blockNumber, uint8_t* responseBuffer) {
-
-    uint8_t status = PN532_Error::Success;
-    if (_inListedTags[indexedTagNumber].AuthorizedBlock != blockNumber) {
-        status = AuthenticateBlock(indexedTagNumber, blockNumber);
-    }
-
-    if (status != PN532_Error::Success) return status;
-    
-    status = InDataExchange(indexedTagNumber, Mifare_Command::Read, &blockNumber, 1);
-    if (status != PN532_Error::Success) {
-        LOG_ERROR("ReadDataBlock()", status);
-        return status;
-    }
-
-    memcpy(responseBuffer, _dataBuffer + 1, 16);
-    return status;
-}
-
-/*!
-    @brief    Authenticates, then writes to a block of the Mifare Tag's memory
-    @param    indexedTagNumber  The index of the tag to read
-    @param    blockNumber       Block number to authenticate and read from/write to
-    @param    dataBuffer        Buffer of data to write to the Mifare
-    @returns  Status code
-*/
-uint8_t PN532_I2C::WriteDataBlock(uint8_t indexedTagNumber, uint8_t blockNumber, uint8_t* dataBuffer) {
-
-    if (blockNumber % 16 == 0) {
-        LOG_ERROR("WriteDataBlock()", PN532_Error::Trailer_Block);
-        return PN532_Error::Trailer_Block;
-    }
-
-    uint8_t status = PN532_Error::Success;
-    if (_inListedTags[indexedTagNumber].AuthorizedBlock != blockNumber) {
-        status = AuthenticateBlock(indexedTagNumber, blockNumber);
-    }
-
-    if (status != PN532_Error::Success) return status;
-    
-    uint8_t buffer[17];
-    buffer[0] = blockNumber;
-    memcpy(buffer + 1, dataBuffer, 16);
-
-    status = InDataExchange(indexedTagNumber, Mifare_Command::Write, buffer, 17);
-    if (status != PN532_Error::Success) {
-        LOG_ERROR("WriteDataBlock()", status);
-    }
-
-    return status;
-}
-
-/*!
-    @brief      Deslects tags in Register from active communication with the PN532 using HALTA
-    @param      indexedTagNumber    The indexed number to halt, default halts all tags
-    @param      keepDataInRegister  Whether to keep relevant number in the register
-    @returns    Status code
-*/
-uint8_t PN532_I2C::HaltActiveTarget(int8_t indexedTagNumber, bool keepDataInRegister) {
-
-    _dataBuffer[0] = keepDataInRegister ? inDeselect : inRelease;
-    _dataBuffer[1] = indexedTagNumber + 1; // Convert to logical number
-
-    return SendRecieveDataBuffer(2);
+    return HaltActiveTarget();
 }
 
 #pragma endregion
 
 #pragma region Data Buffer Preparation
+
+uint8_t PN532_I2C::PerformRFTest(void) {
+
+    _dataBuffer[0] = PN532_Command::RFRegulationTest;
+    _dataBuffer[1] = Tag_Type::Mifare;
+    return WriteI2C(_dataBuffer, 2);
+}
 
 // TODO: Can we remove the strings unless using a deeper debug? Should we?
 uint8_t PN532_I2C::SetParameters(PN532_Params params) {
@@ -339,7 +282,8 @@ uint8_t PN532_I2C::SetParameters(PN532_Params params) {
     _dataBuffer[0] = PN532_Command::setParams;
     _dataBuffer[1] = paramsBit;
 
-    WriteI2C(_dataBuffer, 2, true);
+    WriteI2C(_dataBuffer, 2);
+    _suppressPrePostAmble = params.suppressPrePostAmble;
     return ReadI2C(_dataBuffer);
 }
 
@@ -381,12 +325,12 @@ uint8_t PN532_I2C::SetRFConfiguration(RFConfigData data) {
 */
 uint8_t PN532_I2C::AuthenticateBlock(uint8_t indexedTagNumber, uint8_t blockNumber) {
 
-    uint8_t dataBuffer[14];
-    uint8_t dataLength = 1 + (uint8_t)Auth_Key_Size + _inListedTags[indexedTagNumber].UIDLen;
+    uint8_t dataBuffer[14]{};
+    uint8_t dataLength = 1 + (uint8_t)Auth_Key_Size + _inListedTags[indexedTagNumber].UIDLen();
 
     dataBuffer[0] = blockNumber;
     memcpy(dataBuffer + 1, _inListedTags[indexedTagNumber].AuthKey, (uint8_t)Auth_Key_Size);
-    memcpy(dataBuffer + 7, _inListedTags[indexedTagNumber].UID, _inListedTags[indexedTagNumber].UIDLen);
+    memcpy(dataBuffer + 7, _inListedTags[indexedTagNumber].UID, _inListedTags[indexedTagNumber].UIDLen());
 
     uint8_t status = InDataExchange(indexedTagNumber, Mifare_Command::AuthA, dataBuffer, dataLength);
     if (status != PN532_Error::Success) {
@@ -424,16 +368,14 @@ uint8_t PN532_I2C::InListPassiveTarget(uint8_t maxTargets, uint8_t* knownUID, ui
     uint8_t status = SendRecieveDataBuffer(3 + uidLength);
     if (status != PN532_Error::Success) return status;
 
-    /*
-      byte            Description
-      -------------   ------------------------------------------
+    /*byte            Description
+      -------------   --------------------
       b0              Tags Found
       b1              Tag Number
       b2..3           SENS_RES
       b4              SEL_RES
       b5              NFCID Length
-      b6..NFCIDLen    NFCID
-    */
+      b6..NFCIDLen    NFCID             */
 
     if (_dataBuffer[0] <= 0) {
         LOG_ERROR("InListPassiveTarget()", PN532_Error::NoTagFound);
@@ -442,10 +384,56 @@ uint8_t PN532_I2C::InListPassiveTarget(uint8_t maxTargets, uint8_t* knownUID, ui
 
     uint8_t tag1DataLength = 5 + _dataBuffer[5];
     for (uint8_t i = 0; i < _dataBuffer[0]; i++) {
+        
+        if(_inListedTags[i].IsActive()) _inListedTags[i].Reset();
+        
         uint8_t uidLocation = 6 + (tag1DataLength * i);
-        memcpy(_inListedTags[i].UID, _dataBuffer + uidLocation, _inListedTags[i].UIDLen);
+        _inListedTags[i].Activate(_dataBuffer + uidLocation);
+    }
 
-        _inListedTags[i].AuthorizedBlock = 0;
+    return status;
+}
+
+/*!
+    @brief    Authenticates, then reads a block of the Mifare Tag's memory
+    @param    indexedTagNumber  The index of the tag to read
+    @param    blockNumber       Block number to authenticate and read from/write to
+    @param    responseBuffer    Buffer to read the data to
+    @returns  Status code
+*/
+uint8_t PN532_I2C::ReadActiveDataBlock(uint8_t indexedTagNumber, uint8_t blockNumber, uint8_t* responseBuffer) {
+
+    uint8_t status = InDataExchange(indexedTagNumber, Mifare_Command::Read, &blockNumber, 1);
+    if (status != PN532_Error::Success) {
+        LOG_ERROR("ReadDataBlock()", status);
+        return status;
+    }
+
+    memcpy(responseBuffer, _dataBuffer + 1, 16);
+    return status;
+}
+
+/*!
+    @brief    Authenticates, then writes to a block of the Mifare Tag's memory
+    @param    indexedTagNumber  The index of the tag to read
+    @param    blockNumber       Block number to authenticate and read from/write to
+    @param    dataBuffer        Buffer of data to write to the Mifare
+    @returns  Status code
+*/
+uint8_t PN532_I2C::WriteActiveDataBlock(uint8_t indexedTagNumber, uint8_t blockNumber, uint8_t* dataBuffer) {
+
+    if (blockNumber % 16 == 0) {
+        LOG_ERROR("WriteDataBlock()", PN532_Error::Trailer_Block);
+        return PN532_Error::Trailer_Block;
+    }
+
+    uint8_t buffer[17]{};
+    buffer[0] = blockNumber;
+    memcpy(buffer + 1, dataBuffer, 16);
+
+    uint8_t status = InDataExchange(indexedTagNumber, Mifare_Command::Write, buffer, 17);
+    if (status != PN532_Error::Success) {
+        LOG_ERROR("WriteDataBlock()", status);
     }
 
     return status;
@@ -489,11 +477,37 @@ uint8_t PN532_I2C::InCommunicateThrough(uint8_t* data, uint8_t dataLength) {
         : success;
 }
 
+/*!
+    @brief      Deslects tags in Register from active communication with the PN532 using HALTA
+    @param      indexedTagNumber    The indexed number to halt, default halts all tags
+    @param      keepDataInRegister  Whether to keep relevant number in the register
+    @returns    Status code
+*/
+uint8_t PN532_I2C::HaltActiveTarget(int8_t indexedTagNumber, bool keepDataInRegister) {
+
+    _dataBuffer[0] = keepDataInRegister ? inDeselect : inRelease;
+    _dataBuffer[1] = indexedTagNumber + 1; // Convert to logical number
+
+    uint8_t status = SendRecieveDataBuffer(2);
+    if (keepDataInRegister) return status;
+
+    if (indexedTagNumber < 0) {
+        for (uint8_t i = 0; i < Max_PN532_Targets; i++) {
+            _inListedTags[i].Reset();
+        }
+    }
+    else {
+        _inListedTags[indexedTagNumber].Reset();
+    }
+
+    return status;
+}
+
 #pragma endregion
 
 uint8_t PN532_I2C::SendRecieveDataBuffer(uint8_t headerLength, uint8_t* data, uint8_t dataLength) {
 
-    uint8_t status = WriteI2C(_dataBuffer, headerLength, false, data, dataLength);
+    uint8_t status = WriteI2C(_dataBuffer, headerLength, data, dataLength);
     if (status != PN532_Error::Success) {
         LOG_ERROR("WriteI2C()", status);
         return status;
@@ -515,10 +529,10 @@ uint8_t PN532_I2C::SendRecieveDataBuffer(uint8_t headerLength, uint8_t* data, ui
 */
 // TODO: This can be improved to check the IRQ after implementing power down
 void PN532_I2C::Wakeup() {
-    delay(500);
+    delay(100);
 }
 
-uint8_t PN532_I2C::WriteI2C(const uint8_t* header, uint8_t hlen, bool useFullAck, const uint8_t* body, uint8_t blen) {
+uint8_t PN532_I2C::WriteI2C(const uint8_t* header, uint8_t hlen, const uint8_t* body, uint8_t blen) {
 
     _wire->beginTransmission(PN532_I2C_Address);
 
@@ -558,10 +572,9 @@ uint8_t PN532_I2C::WriteI2C(const uint8_t* header, uint8_t hlen, bool useFullAck
     LOG("\n");
 
     _wire->endTransmission();
-    return ReadAckFrame(useFullAck);
+    return ReadAckFrame();
 }
 
-// If Pre/PostAmble are enabled add a _wire->read() before the NFC_TransferBytes::StartCode1
 uint8_t PN532_I2C::ReadI2C(uint8_t* buffer) {
 
     uint16_t time = 0;
@@ -569,7 +582,7 @@ uint8_t PN532_I2C::ReadI2C(uint8_t* buffer) {
     do {
         uint8_t responseLength = _wire->requestFrom((uint8_t)PN532_I2C_Address, (uint8_t)Max_Buffer_Size);
 
-        if (responseLength <= 0) {
+        if (responseLength < 1 || responseLength > Max_Buffer_Size) {
             delay(1);
             time++;
         }
@@ -580,6 +593,7 @@ uint8_t PN532_I2C::ReadI2C(uint8_t* buffer) {
 
     } while (1);
 
+    if (!_suppressPrePostAmble) _wire->read();
     if (NFC_TransferBytes::StartCode1   != _wire->read() ||
         NFC_TransferBytes::StartCode2   != _wire->read()) {
 
@@ -613,13 +627,12 @@ uint8_t PN532_I2C::ReadI2C(uint8_t* buffer) {
     return !checksum ? PN532_Error::Success : PN532_Error::ChecksumError;
 }
 
-// If Pre/PostAmble are enabled: PN532_ACK[] = { 0, 0, 0xFF, 0, 0xFF, 0 }
-uint8_t PN532_I2C::ReadAckFrame(bool useFullAck) {
+uint8_t PN532_I2C::ReadAckFrame() {
     
-    uint8_t shortAck[] = { 0, 0xFF, 0, 0xFF };
+    uint8_t shortAck[] =   { 0, 0xFF, 0, 0xFF };
     uint8_t longAck[] = { 0, 0, 0xFF, 0, 0xFF, 0 };
     
-    uint8_t bufferSize = useFullAck ? sizeof(longAck) : sizeof(shortAck);
+    uint8_t bufferSize = _suppressPrePostAmble ? sizeof(shortAck) : sizeof(longAck);
     uint8_t ackBuf[6]{};
 
     uint16_t time = 0;
@@ -638,15 +651,13 @@ uint8_t PN532_I2C::ReadAckFrame(bool useFullAck) {
         ackBuf[i] = _wire->read();
     }
 
-    if (useFullAck) {
-        return memcmp(ackBuf, longAck, sizeof(longAck))
-            ? PN532_Error::InvalidACK
-            : PN532_Error::Success;
-    }
+    int outcome = _suppressPrePostAmble
+        ? memcmp(ackBuf, shortAck, sizeof(shortAck))
+        : memcmp(ackBuf, longAck, sizeof(longAck));
 
-    return memcmp(ackBuf, shortAck, sizeof(shortAck))
-        ? PN532_Error::InvalidACK
-        : PN532_Error::Success;
+    return outcome == PN532_Error::Success
+        ? PN532_Error::Success
+        : PN532_Error::InvalidACK;
 }
 
 #pragma endregion
@@ -656,7 +667,7 @@ uint8_t PN532_I2C::ReadAckFrame(bool useFullAck) {
 bool PN532_I2C::IsUniqueUID(MifareClassic* tagsList, uint8_t* uid) {
 
     for (uint8_t i = 0; i < sizeof(tagsList); i++) {        
-        if (!memcmp(tagsList[i].UID, uid, tagsList[i].UIDLen)) return false;
+        if (!memcmp(tagsList[i].UID, uid, tagsList[i].UIDLen())) return false;
     }
 
     return true;
@@ -668,7 +679,7 @@ uint8_t PN532_I2C::GetNextEmptyIndex(MifareClassic* tagList) {
     if (sizeof(tagList) >= 255) return 255;
 
     for (uint8_t i = 0; i < sizeof(tagList); i++) {
-        if (!tagList[i].Initialized) return i;
+        if (!tagList[i].IsActive()) return i;
     }
 
     return 255;

@@ -2,9 +2,9 @@
 #define PN532_I2C_Lite_H
 #include <Wire.h>
 
-class PN532_I2C
-{
+class PN532_I2C {
 public:
+
     PN532_I2C(TwoWire& wire = Wire, uint16_t timeout = 1000);
 
 #pragma region Public Structs
@@ -30,7 +30,7 @@ public:
 
         byte ConfigData[3];
         uint8_t DataLength;
-        CfgItem GetConfigItemType() { return cfgItemType; }
+        CfgItem GetConfigItemType() const { return cfgItemType; }
 
     protected:
         CfgItem cfgItemType;
@@ -62,7 +62,7 @@ public:
         MaxRetryCOM_ConfigData(byte maxRetries = 0x00) {
             cfgItemType = MaxRtyCOM;
             DataLength = 1;
-            ConfigData[0] = maxRetries; // 0xFF is intinite retries
+            ConfigData[0] = maxRetries; // 0xFF is infinite retries
         }
     };
     struct MaxRetries_ConfigData : public RFConfigData {
@@ -78,11 +78,26 @@ public:
     };
 
     struct MifareClassic {
-        static const uint8_t UIDLen = 4;
-        uint8_t UID[UIDLen];        
+        uint8_t UID[4] = { 0x00, 0x00, 0x00, 0x00 };
         uint8_t AuthKey[6] = { 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF };
-        uint8_t AuthorizedBlock = 0;
-        bool Initialized = false;
+        int8_t AuthorizedBlock = -1;
+
+        bool IsActive() const { return _active; }
+        uint8_t UIDLen() { return sizeof(UID) / sizeof(UID[0]); }
+
+        void Activate(uint8_t* uid) {
+            memcpy(UID, uid, sizeof(UID));
+            _active = true;
+        }
+
+        void Reset() {
+            memset(UID, 0, sizeof(UID));
+            AuthorizedBlock = -1;
+            _active = false;
+        }
+
+    private:
+        bool _active = false;
     };
 
 #pragma endregion
@@ -124,7 +139,7 @@ public:
 #pragma endregion
 
     // PN532 Hardware Functions
-    void Configure(RFConfigData* rfParams = nullptr, uint8_t numRFParams = 0, 
+    uint8_t Configure(bool initI2C = true, RFConfigData* rfParams = nullptr, uint8_t numRFParams = 0, 
         PN532_Params params = PN532_Params(), SAMConfigMode config = Normal);
     uint32_t GetFirmwareVersion(void);
     uint8_t ReadRegister(uint16_t registerAddress, uint8_t* buffer);
@@ -134,12 +149,8 @@ public:
     uint8_t EnterPowerDownMode();
 
     // Mifare Classic Helper functions
-    uint8_t FindTargetByUID(uint8_t* targetUID);
     uint8_t ScanForTargets(MifareClassic* tagsList, uint8_t maxExpectedTargets = 1, uint8_t maxRetries = 1);
-    uint8_t QuickAccessMifareTarget(uint8_t* targetUID, uint8_t blockNumber, Mifare_Command command, uint8_t* dataBuffer);
-    uint8_t ReadDataBlock(uint8_t indexedTagNumber, uint8_t blockNumber, uint8_t* responseBuffer);
-    uint8_t WriteDataBlock(uint8_t indexedTagNumber, uint8_t blockNumber, uint8_t* dataBuffer);
-    uint8_t HaltActiveTarget(int8_t indexedTagNumber = -1, bool keepDataInRegister = false);
+    uint8_t HandleTargetOperation(Mifare_Command command, uint8_t* targetUID, uint8_t blockNumber, uint8_t* dataBuffer);
 
 private:
 
@@ -248,23 +259,28 @@ private:
     MifareClassic _inListedTags[2];
     uint8_t _dataBuffer[Max_Buffer_Size];
     uint16_t _i2cTimeout = 1000;
+    bool _suppressPrePostAmble = false;
 
     // Data Buffer Preparation
+    uint8_t PerformRFTest(void);
     uint8_t SetParameters(PN532_Params params);
     uint8_t ConfigureSAM(SAMConfigMode config);
     uint8_t SetRFConfiguration(RFConfigData data);
     uint8_t AuthenticateBlock(uint8_t indexedTagNumber, uint8_t blockNumber);
     uint8_t InListPassiveTarget(uint8_t maxTargets, uint8_t* knownUID = nullptr, uint8_t uidLength = 0);
+    uint8_t ReadActiveDataBlock(uint8_t indexedTagNumber, uint8_t blockNumber, uint8_t* responseBuffer);
+    uint8_t WriteActiveDataBlock(uint8_t indexedTagNumber, uint8_t blockNumber, uint8_t* dataBuffer);
     uint8_t InDataExchange(uint8_t target, Mifare_Command command, uint8_t* data, uint8_t dataLength);
     uint8_t InCommunicateThrough(uint8_t* data, uint8_t dataLength);
+    uint8_t HaltActiveTarget(int8_t indexedTagNumber = -1, bool keepDataInRegister = false);
 
     uint8_t SendRecieveDataBuffer(uint8_t headerLength, uint8_t* data = 0, uint8_t dataLength = 0);
 
     // I2C Communication
     void Wakeup();
-    uint8_t WriteI2C(const uint8_t* header, uint8_t hlen, bool useFullAck = false, const uint8_t* body = 0, uint8_t blen = 0);
+    uint8_t WriteI2C(const uint8_t* header, uint8_t hlen, const uint8_t* body = 0, uint8_t blen = 0);
     uint8_t ReadI2C(uint8_t* buffer);
-    uint8_t ReadAckFrame(bool useFullAck);
+    uint8_t ReadAckFrame();
 
     // Helper Functions
     bool IsUniqueUID(MifareClassic* tagsList, uint8_t* uid);
