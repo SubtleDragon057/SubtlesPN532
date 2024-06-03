@@ -78,11 +78,26 @@ public:
     };
 
     struct MifareClassic {
-        static const uint8_t UIDLen = 4;
-        uint8_t UID[UIDLen];        
+        uint8_t UID[4] = { 0x00, 0x00, 0x00, 0x00 };
         uint8_t AuthKey[6] = { 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF };
-        uint8_t AuthorizedBlock = 0;
-        bool Initialized = false;
+        int8_t AuthorizedBlock = -1;
+
+        bool IsActive() const { return _active; }
+        uint8_t UIDLen() { return sizeof(UID) / sizeof(UID[0]); }
+
+        void Activate(uint8_t* uid) {
+            memcpy(UID, uid, sizeof(UID));
+            _active = true;
+        }
+
+        void Reset() {
+            memset(UID, 0, sizeof(UID));
+            AuthorizedBlock = -1;
+            _active = false;
+        }
+
+    private:
+        bool _active = false;
     };
 
 #pragma endregion
@@ -134,12 +149,8 @@ public:
     uint8_t EnterPowerDownMode();
 
     // Mifare Classic Helper functions
-    uint8_t FindTargetByUID(uint8_t* targetUID);
     uint8_t ScanForTargets(MifareClassic* tagsList, uint8_t maxExpectedTargets = 1, uint8_t maxRetries = 1);
-    uint8_t QuickAccessMifareTarget(uint8_t* targetUID, uint8_t blockNumber, Mifare_Command command, uint8_t* dataBuffer);
-    uint8_t ReadDataBlock(uint8_t indexedTagNumber, uint8_t blockNumber, uint8_t* responseBuffer);
-    uint8_t WriteDataBlock(uint8_t indexedTagNumber, uint8_t blockNumber, uint8_t* dataBuffer);
-    uint8_t HaltActiveTarget(int8_t indexedTagNumber = -1, bool keepDataInRegister = false);
+    uint8_t HandleTargetOperation(Mifare_Command command, uint8_t* targetUID, uint8_t blockNumber, uint8_t* dataBuffer);
 
 private:
 
@@ -257,8 +268,11 @@ private:
     uint8_t SetRFConfiguration(RFConfigData data);
     uint8_t AuthenticateBlock(uint8_t indexedTagNumber, uint8_t blockNumber);
     uint8_t InListPassiveTarget(uint8_t maxTargets, uint8_t* knownUID = nullptr, uint8_t uidLength = 0);
+    uint8_t ReadActiveDataBlock(uint8_t indexedTagNumber, uint8_t blockNumber, uint8_t* responseBuffer);
+    uint8_t WriteActiveDataBlock(uint8_t indexedTagNumber, uint8_t blockNumber, uint8_t* dataBuffer);
     uint8_t InDataExchange(uint8_t target, Mifare_Command command, uint8_t* data, uint8_t dataLength);
     uint8_t InCommunicateThrough(uint8_t* data, uint8_t dataLength);
+    uint8_t HaltActiveTarget(int8_t indexedTagNumber = -1, bool keepDataInRegister = false);
 
     uint8_t SendRecieveDataBuffer(uint8_t headerLength, uint8_t* data = 0, uint8_t dataLength = 0);
 
