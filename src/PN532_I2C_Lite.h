@@ -19,6 +19,13 @@ public:
         PN532_Params() {};
     };
 
+    struct RegisterAddress {
+        const uint8_t ADR1;
+        const uint8_t ADR2;
+        RegisterAddress(uint8_t sfrAddress) : ADR1(0xFF), ADR2(sfrAddress) {}
+        RegisterAddress(uint8_t xramMSB, uint8_t xramLSB) : ADR1(xramMSB), ADR2(xramMSB) {}
+    };
+
     // Config structs for the Baudrate configs not included
     struct RFConfigData {
         enum CfgItem {
@@ -142,7 +149,7 @@ public:
     uint8_t Configure(bool initI2C = true, RFConfigData* rfParams = nullptr, uint8_t numRFParams = 0, 
         PN532_Params params = PN532_Params(), SAMConfigMode config = Normal);
     uint32_t GetFirmwareVersion(void);
-    uint8_t ReadRegister(uint16_t registerAddress, uint8_t* buffer);
+    uint8_t ReadRegister(RegisterAddress address, uint8_t& out_data);
     uint8_t WriteRegister(uint16_t registerAddress, uint8_t newValue);
     uint8_t ReadGPIO(uint8_t* buffer);
     uint8_t WriteGPIO(PN532_GPIO_Commands command);
@@ -263,6 +270,7 @@ private:
 
     // Data Buffer Preparation
     uint8_t PerformRFTest(void);
+    uint8_t CheckPrePostambleSettings();
     uint8_t SetParameters(PN532_Params params);
     uint8_t ConfigureSAM(SAMConfigMode config);
     uint8_t SetRFConfiguration(RFConfigData data);
@@ -275,6 +283,7 @@ private:
     uint8_t HaltActiveTarget(int8_t indexedTagNumber = -1, bool keepDataInRegister = false);
 
     uint8_t SendRecieveDataBuffer(uint8_t headerLength, uint8_t* data = 0, uint8_t dataLength = 0);
+    void ResetDataBuffer();
 
     // I2C Communication
     void Wakeup();

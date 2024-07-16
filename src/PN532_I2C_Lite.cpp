@@ -23,11 +23,13 @@ uint8_t PN532_I2C::Configure(bool initI2C, RFConfigData* rfParams, uint8_t numRF
     if(initI2C) _wire->begin();
     Wakeup();
 
-    memset(_dataBuffer, 0, Max_Buffer_Size);
+    uint8_t status = CheckPrePostambleSettings();
+    if (status != PN532_Error::Success) {
+        LOG_ERROR("CheckPrePostambleSettings()", status);
+        return status;
+    }
 
-    // TODO: Get current configuration for comparison
-
-    uint8_t status = SetParameters(params);
+    status = SetParameters(params);
     if (status != PN532_Error::Success) {
         LOG_ERROR("SetParameters()", status);
         return status;
@@ -82,15 +84,15 @@ uint32_t PN532_I2C::GetFirmwareVersion(void) {
     @param    buffer            Buffer to write the register value to
     @returns  Status code
 */
-uint8_t PN532_I2C::ReadRegister(uint16_t registerAddress, uint8_t* buffer) {
-
+uint8_t PN532_I2C::ReadRegister(RegisterAddress address, uint8_t& out_data) {
+    
     _dataBuffer[0] = PN532_Command::readRegister;
-    _dataBuffer[1] = (registerAddress >> 8) & 0xFF;
-    _dataBuffer[2] = registerAddress & 0xFF;
+    _dataBuffer[1] = address.ADR1;
+    _dataBuffer[2] = address.ADR2;
 
     int8_t status = SendRecieveDataBuffer(3);
     if (status == PN532_Error::Success) {
-        *buffer = _dataBuffer[0];
+        out_data = _dataBuffer[0];
     }
 
     return status;
@@ -253,6 +255,22 @@ uint8_t PN532_I2C::PerformRFTest(void) {
     _dataBuffer[0] = PN532_Command::RFRegulationTest;
     _dataBuffer[1] = Tag_Type::Mifare;
     return WriteI2C(_dataBuffer, 2);
+}
+
+uint8_t PN532_I2C::CheckPrePostambleSettings() {
+    
+    // Test with default no suppression
+    _suppressPrePostAmble = false;
+    _dataBuffer[0] = PN532_Command::getGeneralStatus;
+    uint8_t status = WriteI2C(_dataBuffer, 1);
+    if (status == PN532_Error::Success) return status;
+
+    ResetDataBuffer();
+    
+    // Change suppression if test failed
+    _suppressPrePostAmble = true;
+    _dataBuffer[0] = PN532_Command::getGeneralStatus;
+    return WriteI2C(_dataBuffer, 1);
 }
 
 // TODO: Can we remove the strings unless using a deeper debug? Should we?
@@ -505,6 +523,7 @@ uint8_t PN532_I2C::HaltActiveTarget(int8_t indexedTagNumber, bool keepDataInRegi
 
 #pragma endregion
 
+// TODO: Should we reset the data buffer here on a failure?
 uint8_t PN532_I2C::SendRecieveDataBuffer(uint8_t headerLength, uint8_t* data, uint8_t dataLength) {
 
     uint8_t status = WriteI2C(_dataBuffer, headerLength, data, dataLength);
@@ -519,6 +538,10 @@ uint8_t PN532_I2C::SendRecieveDataBuffer(uint8_t headerLength, uint8_t* data, ui
     }
 
     return status;
+}
+
+void PN532_I2C::ResetDataBuffer() {
+    memset(_dataBuffer, 0, Max_Buffer_Size);
 }
 
 #pragma region I2C Communication
@@ -536,7 +559,7 @@ uint8_t PN532_I2C::WriteI2C(const uint8_t* header, uint8_t hlen, const uint8_t* 
 
     _wire->beginTransmission(PN532_I2C_Address);
 
-    _wire->write(NFC_TransferBytes::PrePostamble);
+    if(!_suppressPrePostAmble) _wire->write(NFC_TransferBytes::PrePostamble);
     _wire->write(NFC_TransferBytes::StartCode1);
     _wire->write(NFC_TransferBytes::StartCode2);
 
@@ -567,7 +590,7 @@ uint8_t PN532_I2C::WriteI2C(const uint8_t* header, uint8_t hlen, const uint8_t* 
 
     uint8_t checksum = ~sum + 1;            // checksum of TFI + DATA
     _wire->write(checksum);
-    _wire->write(NFC_TransferBytes::PrePostamble);
+    if (!_suppressPrePostAmble) _wire->write(NFC_TransferBytes::PrePostamble);
 
     LOG("\n");
 
@@ -621,7 +644,7 @@ uint8_t PN532_I2C::ReadI2C(uint8_t* buffer) {
         buffer[i] = _wire->read();
         LOG_HEX(buffer[i]);
     }
-    LOG('\n');
+    LOG("\n");
 
     checksum = _wire->read();
     return !checksum ? PN532_Error::Success : PN532_Error::ChecksumError;
