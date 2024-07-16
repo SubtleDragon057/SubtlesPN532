@@ -34,7 +34,7 @@ public:
     static void LogError(const char* location, uint8_t error) {
         Serial.print("[ERROR] "); Serial.print(location); Serial.print(": ");
 
-#ifdef DEBUG
+#ifdef _DEBUG
         Serial.println(GetErrorMessage(error));
 #else
         Serial.print("0x");
